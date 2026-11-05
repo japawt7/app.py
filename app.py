@@ -99,7 +99,13 @@ def summarize(values):
 def registrar(tid, venue):
     """Registra no banco os jogos finalizados da temporada atual do time. Retorna (ids, pendentes)."""
     init_db()
-    fx = cached(("last", tid), 3600, lambda: api("/fixtures", {"team": tid, "last": 50, "timezone": TZ}))
+    # o plano grátis não aceita o parâmetro "last": busca os jogos do time por temporada
+    hoje = date.today()
+    seasons = [hoje.year] if hoje.month >= 7 else [hoje.year, hoje.year - 1]
+    fx = []
+    for ss in seasons:
+        fx += cached(("team", tid, ss), 3600,
+                     lambda ss=ss: api("/fixtures", {"team": tid, "season": ss, "timezone": TZ}))
     fx = [f for f in fx if f["fixture"]["status"]["short"] == "FT"]
     if not fx:
         return [], 0
