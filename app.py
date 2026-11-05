@@ -16,6 +16,7 @@ KEY = os.environ.get("APIFOOTBALL_KEY")      # NUNCA colocar a chave no código
 DB_URL = os.environ.get("DATABASE_URL")      # Postgres (Supabase, Neon ou Render)
 MAX_NEW = int(os.environ.get("MAX_NEW_PER_REQUEST", 15))  # protege sua cota diária
 TZ = "America/Sao_Paulo"
+LIVE_TTL = int(os.environ.get("LIVE_TTL", 60))  # segundos entre consultas de jogos ao vivo
 
 TIPOS = {"Total Shots": "shots", "Shots on Goal": "sot", "Corner Kicks": "corners",
          "Offsides": "offsides", "Fouls": "fouls", "Yellow Cards": "yellow",
@@ -52,13 +53,29 @@ def q(sql, args=None, many=False):
             return cur.fetchall() if cur.description else None
 
 
-if DB_URL:
+_db_ok = False
+
+
+def init_db():
+    """Cria as tabelas na primeira vez que o banco é usado (não derruba o servidor se falhar)."""
+    global _db_ok
+    if _db_ok:
+        return
     q("""CREATE TABLE IF NOT EXISTS games(
             id BIGINT PRIMARY KEY, played_at TEXT, league TEXT,
             home_id BIGINT, away_id BIGINT, home TEXT, away TEXT, hg INT, ag INT);
          CREATE TABLE IF NOT EXISTS stats(
             game_id BIGINT, team_id BIGINT, k TEXT, v DOUBLE PRECISION,
             PRIMARY KEY(game_id, team_id, k));""")
+    _db_ok = True
+
+
+def erro_txt(e):
+    if isinstance(e, RuntimeError):
+        return str(e)
+    if isinstance(e, psycopg2.Error):
+        return "erro no banco (confira se DATABASE_URL começa com postgresql://, sem aspas e sem a palavra psql)"
+    return type(e).__name__
 
 
 def num(v):
@@ -81,6 +98,7 @@ def summarize(values):
 
 def registrar(tid, venue):
     """Registra no banco os jogos finalizados da temporada atual do time. Retorna (ids, pendentes)."""
+    init_db()
     fx = cached(("last", tid), 3600, lambda: api("/fixtures", {"team": tid, "last": 50, "timezone": TZ}))
     fx = [f for f in fx if f["fixture"]["status"]["short"] == "FT"]
     if not fx:
@@ -108,6 +126,21 @@ def registrar(tid, venue):
     return ids, max(0, len(pend) - MAX_NEW)
 
 
+def slim(t):
+    return {k: t.get(k) for k in ("id", "name", "logo")}
+
+
+def lg(l):
+    return {k: l.get(k) for k in ("id", "name", "country", "logo")}
+
+
+def card(f):
+    s = f["fixture"]["status"]
+    return {"id": f["fixture"]["id"], "date": f["fixture"]["date"], "ts": f["fixture"]["timestamp"],
+            "status": s["short"], "elapsed": s["elapsed"], "goals": f["goals"], "league": lg(f["league"]),
+            "home": slim(f["teams"]["home"]), "away": slim(f["teams"]["away"])}
+
+
 @app.get("/api/fixtures")
 def fixtures():
     if not KEY:
@@ -123,11 +156,8 @@ def fixtures():
         data = []
         for i in range((end - start).days + 1):
             d = start + timedelta(days=i)
-            data += cached(("day", d), 900, lambda d=d: api("/fixtures", {"date": d.isoformat(), "timezone": TZ}))
-        slim = lambda t: {k: t.get(k) for k in ("id", "name", "logo")}
-        lg = lambda l: {k: l.get(k) for k in ("id", "name", "country", "logo")}
-        return jsonify(data=[{"id": f["fixture"]["id"], "date": f["fixture"]["date"], "league": lg(f["league"]),
-                              "home": slim(f["teams"]["home"]), "away": slim(f["teams"]["away"])} for f in data])
+            data += cached(("day", d), 120 if d == date.today() else 900, lambda d=d: api("/fixtures", {"date": d.isoformat(), "timezone": TZ}))
+        return jsonify(data=[card(f) for f in data])
     except (requests.RequestException, RuntimeError) as e:
         return jsonify(error=f"Falha no fornecedor de dados: {e}"), 502
 
@@ -142,7 +172,7 @@ def team_stats(tid):
     try:
         ids, pendentes = registrar(tid, venue)
     except (requests.RequestException, RuntimeError, psycopg2.Error) as e:
-        return jsonify(error=f"Falha ao registrar jogos: {type(e).__name__}"), 502
+        return jsonify(error=f"Falha ao registrar jogos: {erro_txt(e)}"), 502
     if not ids:
         return jsonify(games=0, total=0, pending=0, stats={})
     games = {g["id"]: g for g in q("SELECT * FROM games WHERE id = ANY(%s)", (ids,))}
@@ -155,6 +185,55 @@ def team_stats(tid):
         series[("" if r["team_id"] == tid else "opp_") + r["k"]].append(r["v"])
     return jsonify(games=len(games), total=len(ids), pending=pendentes,
                    stats={k: summarize(v) for k, v in series.items()})
+
+
+@app.get("/api/team/<int:tid>/games")
+def team_games(tid):
+    """Jogos da temporada do time (mais recente primeiro), com estatísticas do time e do adversário."""
+    if not KEY or not DB_URL:
+        return jsonify(error="Servidor sem APIFOOTBALL_KEY ou DATABASE_URL configurados."), 500
+    try:
+        ids, pendentes = registrar(tid, "all")
+    except (requests.RequestException, RuntimeError, psycopg2.Error) as e:
+        return jsonify(error=f"Falha ao registrar jogos: {erro_txt(e)}"), 502
+    if not ids:
+        return jsonify(games=[], total=0, pending=0)
+    st = defaultdict(lambda: defaultdict(dict))
+    for r in q("SELECT game_id,team_id,k,v FROM stats WHERE game_id = ANY(%s) AND k<>'_ok'", (ids,)):
+        st[r["game_id"]][r["team_id"]][r["k"]] = r["v"]
+    out = []
+    for g in q("SELECT * FROM games WHERE id = ANY(%s) ORDER BY played_at DESC", (ids,)):
+        casa = g["home_id"] == tid
+        own = dict(st[g["id"]].get(tid, {}))
+        opp = dict(st[g["id"]].get(g["away_id"] if casa else g["home_id"], {}))
+        own["goals"], opp["goals"] = (g["hg"], g["ag"]) if casa else (g["ag"], g["hg"])
+        out.append({"date": g["played_at"], "home": casa, "opp": g["away"] if casa else g["home"],
+                    "own": own, "opp_s": opp})
+    return jsonify(games=out, total=len(ids), pending=pendentes)
+
+
+@app.get("/api/live")
+def live():
+    """Jogos acontecendo agora (1 consulta compartilhada por todos os visitantes)."""
+    if not KEY:
+        return jsonify(error="Chave da API não configurada no servidor."), 500
+    try:
+        data = cached(("live",), LIVE_TTL, lambda: api("/fixtures", {"live": "all", "timezone": TZ}))
+        return jsonify(data=[{"id": f["fixture"]["id"], "status": f["fixture"]["status"]["short"],
+                              "elapsed": f["fixture"]["status"]["elapsed"], "goals": f["goals"]} for f in data])
+    except (requests.RequestException, RuntimeError) as e:
+        return jsonify(error=f"Falha no fornecedor de dados: {e}"), 502
+
+
+@app.get("/api/fixture/<int:fid>")
+def one_fixture(fid):
+    if not KEY:
+        return jsonify(error="Chave da API não configurada no servidor."), 500
+    try:
+        r = cached(("one", fid), 30, lambda: api("/fixtures", {"id": fid, "timezone": TZ}))
+        return jsonify(data=card(r[0]) if r else None)
+    except (requests.RequestException, RuntimeError) as e:
+        return jsonify(error=f"Falha no fornecedor de dados: {e}"), 502
 
 
 @app.get("/")
